@@ -120,7 +120,7 @@ const timestamp =
     "PartyB": shortCode,
     "PhoneNumber": phone,
     // change this callback to the url of the hosted server
-    "CallBackURL": "https://10cd-41-90-176-96.ngrok-free.app/callbackurl",
+    "CallBackURL": "https://pmrzjwanq8.us-east-1.awsapprunner.com/callbackurl",
     "AccountReference": "BITIKA",
     "TransactionDesc": "test"
   };
