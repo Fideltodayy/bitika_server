@@ -1,15 +1,18 @@
 const express = require("express");
 const axios = require("axios");
-const IntaSend = require('intasend-node');
 
 const app = express();
 require("dotenv").config();
 const cors = require("cors");
   
 
-app.listen(process.env.PORT, () => {
-  console.log(`Server is running on port ${process.env.PORT}`);
+// Create server first, then attach Express
+const server = require('http').createServer(app);
+// Initialize Socket.IO with the server
+const io = require('socket.io')(server, {
+  cors: { origin: "*" }
 });
+
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -18,101 +21,162 @@ app.get("/", (req, res) => {
   res.send("<h1>Hello World!</h1>");
 });
 
-app.post("/intasend", async (req, res) => {
-  const amount = req.body.amount;
-  const PhoneNumber = req.body.phoneNumber
-  console.log(amount, PhoneNumber)
+// Store connected socket clients
+let connectedClients = [];
+
+io.on('connection', (socket) => {
+  console.log('Client connected:', socket.id);
+  connectedClients.push(socket);
+  
+  socket.emit("converse", { message: "Welcome to the chat!" });
+  
+  socket.on('disconnect', () => {
+    console.log('Client disconnected:', socket.id);
+    connectedClients = connectedClients.filter(client => client.id !== socket.id);
+  });
+});
+
+app.get("/token", (req, res) => {
+  getAccessToken();
+})
+// middleware function to get the access token
+const getAccessToken = async (res, req, next) => {
+
+  const consumerKey = process.env.CONSUMER_KEY
+  const consumerSecret = process.env.CONSUMER_SECRET
+
+  //choose one depending on you development environment
+  // const url = "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"  //sandbox
+  const url = "https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials" //live
+
   try {
-    const intasend = new IntaSend(
-      process.env.ISPubKey,
-      process.env.ISSecretKey,
-      true // True for a test environment
-    );
+ 
+      const encodedCredentials = new Buffer.from(consumerKey + ":" + consumerSecret).toString('base64');
 
-    const collection = intasend.collection();
-    
-    // Initiate MPESA STK Push
-    const stkResponse = await collection.mpesaStkPush({
-      first_name: "Joe",
-      last_name: "Doe",
-      email: "joe@doe.com",
-      host: "https://yourwebsite.com",
-      amount: amount,
-      phone_number: PhoneNumber,
-    });
+      const headers = {
+          'Authorization': "Basic" + " " + encodedCredentials,
+          'Content-Type': 'application/json'
+      }; 
 
-    if (!stkResponse || !stkResponse.invoice || !stkResponse.invoice.invoice_id) {
-      throw new Error("Failed to initiate transaction.");
-    }
+      const response = await axios.get(url, { headers });
+      // console.log(response.data.access_token);
+      token = response.data.access_token;
+      next();
+      } catch (error) {
+      
+      throw new Error('Failed to get access token.');
+  }
+}
 
-    const invoiceID = stkResponse.invoice.invoice_id;
-    console.log(`Transaction initiated, Invoice ID: ${invoiceID}`);
+app.post("/stk", getAccessToken, async (req, res) => {
 
-    // Function to poll transaction status
-    const pollTransactionStatus = async (invoiceID, retries = 20, delay = 20000) => {
-      for (let i = 0; i < retries; i++) {
-        try {
-          const statusResponse = await collection.status(invoiceID);
+// make sure the body contains amount and phone
+if (!req.body.amount || !req.body.phone) {
+  return res.status(400).send("Invalid request");
+}
 
-          if (statusResponse && statusResponse.invoice) {
-            const state = statusResponse.invoice.state;
+// receive the phone number and amount from the request body
+const amount = req.body.amount;
+const phone = req.body.phone;
 
-            console.log(`Attempt ${i + 1}: Transaction State: ${state} for Invoice ID: ${invoiceID}`);
+// validate the phone number and amount
+if (!amount || !phone) {
+  return res.status(400).send("Invalid request");
+}
 
-            if (state === "COMPLETE" || state === "FAILED") {
-              console.log(statusResponse.meta.customer)
-              return state;
-            }
-          }
-        } catch (err) {
-          console.error("Error fetching transaction status:", err);
-        }
+console.log(phone, amount);
 
-        await new Promise((resolve) => setTimeout(resolve, delay)); // Wait before retrying
-      }
+const date = new Date();
+const timestamp =
+  date.getFullYear() +
+  ("0" + (date.getMonth() + 1)).slice(-2) +
+  ("0" + date.getDate()).slice(-2) +
+  ("0" + date.getHours()).slice(-2) +
+  ("0" + date.getMinutes()).slice(-2) +
+  ("0" + date.getSeconds()).slice(-2);
+  
+  const shortCode = process.env.SHORT_CODE
+  const passkey = process.env.PASSKEY
+  
+  const stk_password = new Buffer.from(shortCode + passkey + timestamp).toString(
+    "base64"
+  );
+  //choose one depending on you development environment
+  // const url = "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
+  const url = "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
 
-      return "TIMEOUT"; // If no final state after retries
-    };
+  const headers = {
+    'Authorization': 'Bearer ' + token,
+    'Content-Type': 'application/json'
+  };
 
-    // Poll for status and send the final response
-    const finalStatus = await pollTransactionStatus(invoiceID);
-    res.json({ status: finalStatus });
+  const requestBody = {
+    "BusinessShortCode": shortCode,
+    "Password": stk_password,
+    "Timestamp": timestamp,
+    "TransactionType": "CustomerPayBillOnline", //till "CustomerBuyGoodsOnline"
+    "Amount": amount,
+    "PartyA": phone,
+    "PartyB": shortCode,
+    "PhoneNumber": phone,
+    // change this callback to the url of the hosted server
+    "CallBackURL": "https://10cd-41-90-176-96.ngrok-free.app/callbackurl",
+    "AccountReference": "BITIKA",
+    "TransactionDesc": "test"
+  };
 
-  } catch (err) {
-    console.error(`STK Push error:`, err);
-    res.status(500).json({ error: "Error initiating payment" });
+  try {
+    const response = await axios.post(url, requestBody, { headers });
+    console.log(response.data);
+    return response.data;
+  } catch (error) {
+    console.error(error);
   }
 });
 
 
-app.post("/confirmstatus", (req, res) => {
-  let intasend = new IntaSend(
-    'ISPubKey_test_8e4361e2-3c73-402e-a581-1e1de0e9b1d9',
-    'ISSecretKey_test_3240bffc-1d51-4568-9045-3c1487e2affb',
-    true, // Test ? Set true for test environment
-  );
+app.post('/callbackurl', (req, res) => {
+  // Check the result code
+  const result_code = req.body.Body.stkCallback.ResultCode;
+  
+  if (result_code !== 0) {
+    // If the result code is not 0, there was an error
+    const error_message = req.body.Body.stkCallback.ResultDesc;
+    const response_data = { ResultCode: result_code, ResultDesc: error_message };
+    console.log(response_data);
+    
+    // Broadcast to all connected clients
+    io.emit('transaction', { status: "error", message: error_message });
+    return res.json(response_data);
+  }
 
-  const transactionId = req.body.transactionId;
+  // If the result code is 0, the transaction was completed
+  const body = req.body.Body.stkCallback.CallbackMetadata;
 
-  let collection = intasend.collection();
-  collection
-     .status(transactionId) // the invoice id as it is returned from the stkpush function 
-    .then((resp) => {
-      // Redirect user to URL to complete payment
-      // console.log(`Status Resp:`,resp);
-      console.log(resp.invoice.state);
-      if (resp.invoice.state == "FAIL") {
-        res.send("Transaction Failed")
+  // Get amount
+  const amountObj = body.Item.find(obj => obj.Name === 'Amount');
+  const amount = amountObj.Value;
+  
+  // Get Mpesa code
+  const codeObj = body.Item.find(obj => obj.Name === 'MpesaReceiptNumber');
+  const mpesaCode = codeObj.Value;
 
-      } else if (resp.invoice.state == "COMPLETE") {
-        // respond with a message to indicate a successfull transaction
-        res.send("Success");
-        
-      } else {
-        res.send("Transaction in Progress")
-      }
-    })
-      .catch((err) => {
-      console.error(`Status Resp error:`,err);
-    });
+  // Get phone number
+  const phoneNumberObj = body.Item.find(obj => obj.Name === 'PhoneNumber');
+  const phone = phoneNumberObj.Value;
+
+  console.log({amount, mpesaCode, phone});
+  
+  // Broadcast transaction success to all connected clients
+  io.emit('transaction', { message: {amount, mpesaCode, phone}, status: "success" });
+  
+  // Return a success response to mpesa
+  return res.json({ message: {amount, mpesaCode, phone}, status: "success" });
 });
+
+// Use only one port for the server
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
+
